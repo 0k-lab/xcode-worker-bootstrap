@@ -1,0 +1,23 @@
+.DS_Store
+*.mobileprovision
+*.provisionprofile
+report.xml
+fastlane/report.xml
+fastlane/test_output/
+fastlane/README.md
+1password-service-account-token
+*.xcresult
+
+# Never commit secrets
+Secrets/
+*.p8
+*.cer
+*.p12
+*.key
+*.pem
+*.certSigningRequest
+.env
+.env.*
+developer-id-recovery-*/
+config.json
+auth.json

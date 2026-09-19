@@ -1,0 +1,696 @@
+require "base64"
+require "fileutils"
+require "open3"
+require "openssl"
+require "securerandom"
+require "tmpdir"
+require "time"
+
+OP_TOKEN_PATH = File.expand_path("~/.config/xcode-worker/1password-service-account-token")
+SIGNING_KEYCHAIN_PATH = File.expand_path("~/Library/Keychains/xcode-worker.keychain-db")
+LOGIN_KEYCHAIN_PATH = File.expand_path("~/Library/Keychains/login.keychain-db")
+OP_VAULT = ENV.fetch("XCODE_WORKER_OP_VAULT", "automation-apple")
+raise "XCODE_WORKER_OP_VAULT must be a simple 1Password vault name" unless OP_VAULT.match?(/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/)
+OP_REFS = {
+  match_password: "op://#{OP_VAULT}/fastlane-match/password",
+  match_repository: "op://#{OP_VAULT}/fastlane-match/repository",
+  keychain_password: "op://#{OP_VAULT}/xcode-worker-keychain/password",
+  asc_key_id: "op://#{OP_VAULT}/app-store-connect/key_id",
+  asc_issuer_id: "op://#{OP_VAULT}/app-store-connect/issuer_id",
+  asc_private_key: "op://#{OP_VAULT}/app-store-connect/private_key",
+  asc_team_id: "op://#{OP_VAULT}/app-store-connect/team_id",
+  development_apps: "op://#{OP_VAULT}/development-apps/bundle_ids"
+}.freeze
+CERTIFICATE_WARNING_DAYS = 90
+CERTIFICATE_CRITICAL_DAYS = 30
+CANONICAL_CERTIFICATE_TYPES = {
+  "Apple Development" => "development",
+  "Developer ID Application" => "developer_id",
+  "Developer ID Installer" => "developer_id_installer"
+}.freeze
+
+def validate_bundle_id!(bundle_id)
+  value = bundle_id.to_s.strip
+  label = /[A-Za-z][A-Za-z0-9_-]*[A-Za-z0-9_]|[A-Za-z]/
+  unless value.length <= 255 && value.match?(/\A(?:#{label})(?:\.(?:#{label}))+\z/)
+    UI.user_error!("Invalid Bundle ID: #{value.inspect}")
+  end
+  value
+end
+
+def development_app_ids
+  ids = op_values(:development_apps).fetch(:development_apps).lines.map(&:strip).reject(&:empty?).map do |id|
+    validate_bundle_id!(id)
+  end.uniq
+  UI.user_error!("#{OP_VAULT}/development-apps/bundle_ids must contain at least one Bundle ID") if ids.empty?
+  ids
+end
+
+def match_connection(secrets)
+  team_id = secrets.fetch(:asc_team_id)
+  repository = secrets.fetch(:match_repository)
+  UI.user_error!("#{OP_VAULT}/app-store-connect/team_id is invalid") unless team_id.match?(/\A[A-Z0-9]{10}\z/)
+  UI.user_error!("#{OP_VAULT}/fastlane-match/repository must be an SSH or HTTPS Git URL without embedded credentials") unless repository.match?(%r{\A(?:git@[^\s:]+:[^\s?#]+|https://[^\s/@]+/[^\s?#@]+)\z})
+  { team_id: team_id, git_url: repository }
+end
+
+def op_service_account_token
+  stat = File.lstat(OP_TOKEN_PATH)
+  unless stat.file? && stat.uid == Process.uid && (stat.mode & 0o077).zero?
+    UI.user_error!("1Password service account token must be an owned, private regular file at #{OP_TOKEN_PATH}")
+  end
+
+  token = File.read(OP_TOKEN_PATH).strip
+  UI.user_error!("1Password service account token is empty at #{OP_TOKEN_PATH}") if token.empty?
+  token
+rescue Errno::ENOENT
+  UI.user_error!("1Password service account token is missing at #{OP_TOKEN_PATH}")
+rescue Errno::EACCES, Errno::EPERM
+  UI.user_error!("1Password service account token is unreadable at #{OP_TOKEN_PATH}")
+end
+
+def op_values(*names)
+  token = op_service_account_token
+
+  names.to_h do |name|
+    reference = OP_REFS.fetch(name)
+    stdout, _stderr, status = Open3.capture3(
+      { "OP_SERVICE_ACCOUNT_TOKEN" => token }, "op", "read", reference
+    )
+    UI.user_error!("Cannot read #{reference} from 1Password") unless status.success?
+
+    value = stdout.strip
+    UI.user_error!("1Password returned an empty value for #{reference}") if value.empty?
+    [name, value]
+  end
+rescue Errno::ENOENT
+  UI.user_error!("1Password CLI (op) is unavailable")
+end
+
+def asc_private_key(body)
+  Base64.strict_decode64(body)
+  pem = "-----BEGIN PRIVATE KEY-----\n#{body.scan(/.{1,64}/).join("\n")}\n-----END PRIVATE KEY-----\n"
+  key = OpenSSL::PKey.read(pem)
+  UI.user_error!("1Password ASC private key is not a valid EC private key") unless key.is_a?(OpenSSL::PKey::EC) && key.private?
+  pem
+rescue ArgumentError, OpenSSL::PKey::PKeyError
+  UI.user_error!("1Password ASC private key is malformed")
+end
+
+def asc_credentials(*extra_names)
+  secrets = op_values(*extra_names, :asc_key_id, :asc_issuer_id, :asc_private_key)
+  secrets[:asc_private_key] = asc_private_key(secrets[:asc_private_key])
+  secrets
+end
+
+def connect_api_token(credentials)
+  Spaceship::ConnectAPI::Token.create(
+    key_id: credentials.fetch(:asc_key_id),
+    issuer_id: credentials.fetch(:asc_issuer_id),
+    key: credentials.fetch(:asc_private_key)
+  )
+end
+
+def match_api_key(secrets)
+  app_store_connect_api_key(
+    key_id: secrets.fetch(:asc_key_id),
+    issuer_id: secrets.fetch(:asc_issuer_id),
+    key_content: secrets.fetch(:asc_private_key),
+    is_key_content_base64: false,
+    in_house: false
+  )
+end
+
+def with_match_password(password)
+  previous_match_password = ENV["MATCH_PASSWORD"]
+  begin
+    ENV["MATCH_PASSWORD"] = password
+    yield
+  ensure
+    if previous_match_password.nil?
+      ENV.delete("MATCH_PASSWORD")
+    else
+      ENV["MATCH_PASSWORD"] = previous_match_password
+    end
+  end
+end
+
+def canonical_certificate_metadata
+  require "match"
+  params = FastlaneCore::Configuration.create(Match::Options.available_options, {})
+  params.load_configuration_file("Matchfile")
+  UI.user_error!("signing_status requires git match storage") unless params[:storage_mode] == "git"
+  params[:readonly] = true
+  secrets = op_values(:match_password, :match_repository, :asc_team_id)
+  match_connection(secrets).each { |key, value| params[key] = value }
+  storage = Match::Storage.from_params(params)
+  password = secrets.fetch(:match_password)
+
+  Dir.mktmpdir("xcode-worker-signing-status-") do |directory|
+    begin
+      storage.download
+      encryption = Match::Encryption::MatchFileEncryption.new
+      CANONICAL_CERTIFICATE_TYPES.to_h do |label, match_type|
+        cert_type = Match.cert_type_sym(match_type)
+        cert_directory = File.join(storage.prefixed_working_directory, "certs", cert_type.to_s)
+        encrypted_certificates = Dir[File.join(cert_directory, "*.cer")].sort
+        UI.user_error!("#{label}: no canonical certificate in match") if encrypted_certificates.empty?
+
+        entries = encrypted_certificates.map do |encrypted_path|
+          # Match::Runner selects certs and keys by their shared certificate-ID basename.
+          certificate_id = File.basename(encrypted_path, ".cer")
+          key_path = File.join(cert_directory, "#{certificate_id}.p12")
+          UI.user_error!("#{label} #{certificate_id}: matching encrypted private key is missing from match") unless File.file?(key_path)
+
+          certificate_path = File.join(directory, "#{cert_type}-#{certificate_id}.cer")
+          encryption.decrypt(file_path: encrypted_path, password: password, output_path: certificate_path)
+          certificate = OpenSSL::X509::Certificate.new(File.binread(certificate_path))
+          {
+            id: certificate_id,
+            name: certificate.subject.to_a.find { |name, _value, _kind| name == "CN" }&.at(1) || certificate.subject.to_s,
+            serial: certificate.serial.to_s(16).upcase,
+            valid_from: certificate.not_before.utc,
+            expires: certificate.not_after.utc
+          }
+        end
+        [label, entries]
+      end
+    ensure
+      storage.clear_changes
+    end
+  end
+rescue OpenSSL::OpenSSLError => error
+  UI.user_error!("Cannot parse canonical match certificate: #{error.message}")
+end
+
+def sync_signing(readonly:, app_ids: development_app_ids, certificate_id: nil, force: false)
+  secrets = asc_credentials(:match_password, :match_repository, :asc_team_id, :keychain_password)
+  with_match_password(secrets.fetch(:match_password)) do
+    match(
+      **match_connection(secrets),
+      type: "development",
+      app_identifier: app_ids,
+      certificate_id: certificate_id,
+      force: force,
+      api_key: match_api_key(secrets),
+      readonly: readonly,
+      renew_expired_certs: false,
+      keychain_name: "xcode-worker.keychain",
+      keychain_password: secrets.fetch(:keychain_password)
+    )
+  end
+end
+
+def sync_developer_id(type:)
+  prepare_signing_keychain!(op_values(:keychain_password).fetch(:keychain_password))
+  label = type == "developer_id" ? "Developer ID Application" : "Developer ID Installer"
+  state = canonical_developer_id_identity(type: type, common_name: label)
+  UI.user_error!("#{label}: canonical match identity is missing") unless state == :present
+end
+
+def developer_id_match_options(type:, readonly:, secrets:, output_path: nil)
+  {
+    **match_connection(secrets),
+    type: type,
+    platform: "macos",
+    # Match requires an app_identifier even when profile syncing is disabled.
+    app_identifier: development_app_ids.first,
+    readonly: readonly,
+    skip_provisioning_profiles: true,
+    renew_expired_certs: false,
+    keychain_name: "xcode-worker.keychain"
+  }.merge(output_path ? { output_path: output_path } : {})
+end
+
+def developer_id_private_key(path)
+  data = File.binread(path)
+  OpenSSL::PKey.read(data)
+rescue OpenSSL::PKey::PKeyError
+  OpenSSL::PKCS12.new(data, "").key
+end
+
+def canonical_developer_id_identity(type:, common_name:, expected_fingerprint: nil)
+  secrets = op_values(:match_password, :match_repository, :asc_team_id, :keychain_password)
+  Dir.mktmpdir("developer-id-match-") do |output_path|
+    with_match_password(secrets.fetch(:match_password)) do
+      match(**developer_id_match_options(type: type, readonly: true, secrets: secrets, output_path: output_path),
+            keychain_password: secrets.fetch(:keychain_password))
+    end
+
+    certificates = Dir[File.join(output_path, "*.cer")]
+    private_keys = Dir[File.join(output_path, "*.p12")]
+    UI.user_error!("#{common_name}: match did not export exactly one certificate and key") unless certificates.one? && private_keys.one?
+
+    certificate = OpenSSL::X509::Certificate.new(File.binread(certificates.first))
+    fingerprint = OpenSSL::Digest::SHA1.hexdigest(certificate.to_der).upcase
+    if expected_fingerprint && fingerprint != expected_fingerprint
+      UI.user_error!("#{common_name}: readonly match returned a different certificate than expected")
+    end
+    policy = type == "developer_id" ? "codesigning" : "basic"
+    unless keychain_identity_present?(fingerprint, policy: policy, valid_only: true)
+      FastlaneCore::KeychainImporter.import_file(private_keys.first, SIGNING_KEYCHAIN_PATH,
+                                                 keychain_password: secrets.fetch(:keychain_password))
+    end
+    validate_local_developer_id_identity!(certificates.first, private_keys.first, common_name, type)
+    UI.success("#{common_name}: readonly match fetch and certificate/private-key validation succeeded")
+    :present
+  end
+rescue FastlaneCore::Interface::FastlaneCrash => error
+  raise unless error.message.include?("No code signing identity found and cannot create a new one because you enabled `readonly`")
+  :missing
+rescue OpenSSL::OpenSSLError
+  UI.user_error!("#{common_name}: stored certificate/private key cannot be parsed; review it manually without deleting or revoking it")
+end
+
+def import_developer_id_identity!(type:, certificate_path:, private_key_path:, secrets:, username: nil, skip_certificate_matching: false)
+  require "match"
+  params = FastlaneCore::Configuration.create(Match::Options.available_options, {})
+  params.load_configuration_file("Matchfile")
+  match_connection(secrets).each { |key, value| params[key] = value }
+  params[:type] = type
+  params[:platform] = "macos"
+  params[:readonly] = false
+  params[:username] = username if username
+  params[:skip_certificate_matching] = skip_certificate_matching
+  with_match_password(secrets.fetch(:match_password)) do
+    Match::Importer.new.import_cert(params, cert_path: certificate_path,
+                                   p12_path: private_key_path, profile_path: "")
+  end
+end
+
+def with_interactive_apple_auth(team_id:)
+  names = %w[FASTLANE_PASSWORD DELIVER_PASSWORD FASTLANE_SESSION SPACESHIP_SESSION SPACESHIP_COOKIE_PATH FASTLANE_DONT_STORE_PASSWORD FASTLANE_TEAM_ID]
+  previous = names.to_h { |name| [name, ENV[name]] }
+  cookie_directory = Dir.mktmpdir("developer-id-apple-session-")
+  begin
+    names.each { |name| ENV.delete(name) }
+    ENV["FASTLANE_DONT_STORE_PASSWORD"] = "1"
+    ENV["SPACESHIP_COOKIE_PATH"] = cookie_directory
+    ENV["FASTLANE_TEAM_ID"] = team_id
+    Spaceship::ConnectAPI.token = nil
+    Spaceship::ConnectAPI.client = nil
+    yield
+  ensure
+    previous.each { |name, value| value.nil? ? ENV.delete(name) : ENV[name] = value }
+    FileUtils.remove_entry_secure(cookie_directory) if File.exist?(cookie_directory)
+  end
+end
+
+def validate_local_developer_id_identity!(certificate_path, private_key_path, common_name, type)
+  certificate = OpenSSL::X509::Certificate.new(File.binread(certificate_path))
+  private_key = developer_id_private_key(private_key_path)
+  UI.user_error!("#{common_name}: generated private key does not match the certificate") unless private_key && certificate.public_key.public_to_der == private_key.public_key.public_to_der
+  name = certificate.subject.to_a.find { |field| field.first == "CN" }&.at(1)
+  UI.user_error!("#{common_name}: generated certificate has an unexpected common name") unless name.to_s.start_with?("#{common_name}:")
+  UI.user_error!("#{common_name}: generated certificate is outside its validity period") unless certificate.not_before <= Time.now && Time.now < certificate.not_after
+  usage = certificate.extensions.find { |extension| extension.oid == "keyUsage" }&.value.to_s
+  UI.user_error!("#{common_name}: certificate lacks Digital Signature usage") unless usage.include?("Digital Signature")
+
+  fingerprint = OpenSSL::Digest::SHA1.hexdigest(certificate.to_der).upcase
+  policy = type == "developer_id" ? "codesigning" : "basic"
+  UI.user_error!("#{common_name}: certificate and private key are not a valid local identity") unless keychain_identity_present?(fingerprint, policy: policy, valid_only: true)
+  verify_policy = type == "developer_id" ? "codeSign" : "basic"
+  _out, _err, status = Open3.capture3("security", "verify-cert", "-c", certificate_path, "-p", verify_policy, "-L")
+  UI.user_error!("#{common_name}: Apple certificate chain failed #{verify_policy} trust evaluation") unless status.success?
+
+  if type == "developer_id_installer"
+    installer_eku = certificate.extensions.find { |extension| extension.oid == "extendedKeyUsage" }&.value.to_s
+    UI.user_error!("#{common_name}: certificate lacks Apple's Installer signing EKU") unless installer_eku.split(/,\s*/).include?("1.2.840.113635.100.4.13")
+    validate_installer_package_signing!(certificate, fingerprint, common_name)
+  end
+end
+
+def validate_installer_package_signing!(certificate, fingerprint, common_name)
+  Dir.mktmpdir("developer-id-installer-probe-") do |directory|
+    content = File.join(directory, "content")
+    FileUtils.mkdir_p(content)
+    File.write(File.join(content, "probe.txt"), "Local Developer ID Installer signing probe\n")
+    unsigned = File.join(directory, "unsigned.pkg")
+    signed = File.join(directory, "signed.pkg")
+
+    _out, _err, status = Open3.capture3("productbuild", "--content", content, unsigned)
+    UI.user_error!("#{common_name}: could not build disposable local package") unless status.success?
+    _out, _err, status = Open3.capture3("productsign", "--sign", fingerprint, "--keychain",
+                                       SIGNING_KEYCHAIN_PATH, "--timestamp=none", unsigned, signed)
+    UI.user_error!("#{common_name}: private key could not sign a package headlessly") unless status.success?
+    output, _err, status = Open3.capture3("pkgutil", "--check-signature", signed)
+    leaf_section = output.split(/^\s*2\. /).first.to_s
+    reported_fingerprint = leaf_section[/SHA256 Fingerprint:\s*\n((?:\s*[0-9A-F ]+\n)+)/, 1].to_s.gsub(/\s+/, "")
+    expected_fingerprint = OpenSSL::Digest::SHA256.hexdigest(certificate.to_der).upcase
+    unless status.success? && output.include?("Status: signed by a developer certificate issued by Apple for distribution") &&
+           leaf_section.include?(common_name) && reported_fingerprint == expected_fingerprint &&
+           output.include?("Developer ID Certification Authority") && output.include?("Apple Root CA")
+      UI.user_error!("#{common_name}: disposable package signature was not trusted or used the wrong certificate")
+    end
+  end
+  UI.success("#{common_name}: disposable local package signed and verified with the expected identity")
+end
+
+def provision_missing_developer_id_identity!(type:, common_name:, username:, secrets:)
+  require "cert"
+  require "match"
+
+  recovery_root = File.expand_path("~/.config/xcode-worker")
+  root_stat = File.stat(recovery_root)
+  UI.user_error!("Recovery directory must be private and owned by the worker") unless root_stat.uid == Process.uid && (root_stat.mode & 0o077).zero?
+  output_path = Dir.mktmpdir("developer-id-recovery-", recovery_root)
+  stored = false
+
+  begin
+    old_umask = File.umask(0o077)
+    begin
+      Cert.config = FastlaneCore::Configuration.create(Cert::Options.available_options, {
+        platform: "macos", type: type == "developer_id" ? "developer_id_application" : "developer_id_installer",
+        force: true, username: username, team_id: secrets.fetch(:asc_team_id),
+        output_path: output_path, keychain_path: SIGNING_KEYCHAIN_PATH,
+        keychain_password: secrets.fetch(:keychain_password)
+      })
+      certificate_path = Cert::Runner.new.launch
+    ensure
+      File.umask(old_umask)
+    end
+
+    certificate_id = ENV.fetch("CER_CERTIFICATE_ID")
+    private_key_path = File.join(output_path, "#{certificate_id}.p12")
+    validate_local_developer_id_identity!(certificate_path, private_key_path, common_name, type)
+    fingerprint = OpenSSL::Digest::SHA1.hexdigest(OpenSSL::X509::Certificate.new(File.binread(certificate_path)).to_der).upcase
+
+    import_developer_id_identity!(type: type, certificate_path: certificate_path,
+                                  private_key_path: private_key_path, secrets: secrets, username: username,
+                                  skip_certificate_matching: type == "developer_id_installer")
+    unless canonical_developer_id_identity(type: type, common_name: common_name, expected_fingerprint: fingerprint) == :present
+      UI.user_error!("#{common_name}: readonly match validation failed after import")
+    end
+    stored = true
+    UI.success("#{common_name}: certificate and private key stored and validated readonly in canonical match")
+  rescue StandardError => error
+    if error.message.match?(/maximum number|already have a current|reached the maximum/i)
+      UI.user_error!("#{common_name}: Apple's certificate limit blocked creation. Review existing certificates with the Account Holder and deliberately retire only a selected legacy certificate before retrying; nothing was revoked here.")
+    end
+    raise
+  ensure
+    if stored
+      FileUtils.remove_entry_secure(output_path)
+    elsif Dir[File.join(output_path, "*.p12")].any?
+      UI.important("#{common_name}: provisioning stopped; locally generated material was preserved for diagnosis at #{output_path} (private directory). Do not create another certificate until reviewed.")
+    else
+      FileUtils.remove_entry_secure(output_path)
+    end
+  end
+end
+
+def unlock_signing_keychain!(password)
+  UI.user_error!("Dedicated signing keychain is missing at #{SIGNING_KEYCHAIN_PATH}") unless File.file?(SIGNING_KEYCHAIN_PATH)
+  _out, _err, status = Open3.capture3("security", "unlock-keychain", "-p", password, SIGNING_KEYCHAIN_PATH)
+  UI.user_error!("Could not unlock the dedicated signing keychain") unless status.success?
+  _out, _err, status = Open3.capture3("security", "show-keychain-info", SIGNING_KEYCHAIN_PATH)
+  UI.user_error!("Dedicated signing keychain remains locked") unless status.success?
+end
+
+def prepare_signing_keychain!(password)
+  unlock_signing_keychain!(password)
+  output, _err, status = Open3.capture3("security", "list-keychains", "-d", "user")
+  UI.user_error!("Could not inspect the user keychain search list") unless status.success?
+
+  # A headless session on this worker returned legacy "login-db" and
+  # "xcode-worker-db" aliases. Security could open the dedicated keychain by
+  # explicit path, but its default search list found no Apple CA certificates.
+  paths = output.lines.map { |line| line.strip.delete('"') }.map do |path|
+    expanded = path.sub(/-db\z/, ".keychain-db")
+    File.file?(path) ? path : expanded
+  end.select { |path| File.file?(path) }
+  paths |= [LOGIN_KEYCHAIN_PATH, SIGNING_KEYCHAIN_PATH].select { |path| File.file?(path) }
+  UI.user_error!("Dedicated keychain is absent from the user search list") unless paths.include?(SIGNING_KEYCHAIN_PATH)
+  _out, _err, status = Open3.capture3("security", "list-keychains", "-d", "user", "-s", *paths)
+  UI.user_error!("Could not configure the user keychain search list") unless status.success?
+
+  output, _err, status = Open3.capture3("security", "find-certificate", "-a", "-p", "-c", "Developer ID Certification Authority")
+  UI.user_error!("Default keychain search cannot find Developer ID Certification Authority") unless status.success? && output.include?("BEGIN CERTIFICATE")
+end
+
+def verify_developer_id_ca!
+  output, _err, status = Open3.capture3("security", "find-certificate", "-a", "-p", "-c", "Developer ID Certification Authority")
+  UI.user_error!("Developer ID CA is not visible in the default keychain search list") unless status.success?
+  certificates = output.scan(/-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----/m).map do |pem|
+    OpenSSL::X509::Certificate.new(pem)
+  end
+  { "G1" => certificates.find { |cert| cert.subject.to_a.any? { |name, value, _| name == "OU" && value == "Apple Certification Authority" } },
+    "G2" => certificates.find { |cert| cert.subject.to_a.any? { |name, value, _| name == "OU" && value == "G2" } } }.each do |generation, cert|
+    UI.user_error!("Developer ID Certification Authority #{generation} is missing from the default keychain search list") unless cert
+    Dir.mktmpdir("developer-id-ca-check-") do |directory|
+      path = File.join(directory, "developer-id-ca.cer")
+      File.binwrite(path, cert.to_der)
+      _out, _err, result = Open3.capture3("security", "verify-cert", "-c", path, "-p", "basic", "-L")
+      UI.user_error!("Developer ID #{generation} chain is not trusted through the default keychain search list") unless result.success?
+    end
+  end
+end
+
+def keychain_identity_present?(fingerprint, policy:, valid_only:)
+  command = ["security", "find-identity"]
+  command << "-v" if valid_only
+  command += ["-p", policy, SIGNING_KEYCHAIN_PATH]
+  output, _err, status = Open3.capture3(*command)
+  status.success? && output.match?(/^\s*\d+\) #{Regexp.escape(fingerprint)} \"/i)
+end
+
+def private_key_item_count
+  output, _err, status = Open3.capture3("security", "find-key", "-t", "private", SIGNING_KEYCHAIN_PATH)
+  UI.user_error!("Could not count private keys in the dedicated keychain") unless status.success?
+  output.scan(/class: 0x00000010/).length
+end
+
+def local_import_probe!(password)
+  prepare_signing_keychain!(password)
+  verify_developer_id_ca!
+  keys_before = private_key_item_count
+  valid_identities, _err, status = Open3.capture3("security", "find-identity", "-v", "-p", "codesigning", SIGNING_KEYCHAIN_PATH)
+  unless status.success? && valid_identities.include?("Apple Development:")
+    UI.user_error!("Existing Apple Development identity is not valid in the dedicated keychain")
+  end
+  csr, key = Spaceship::ConnectAPI::Certificate.create_certificate_signing_request
+  certificate = OpenSSL::X509::Certificate.new
+  certificate.version = 2
+  certificate.serial = SecureRandom.random_number(2**63 - 1) + 1
+  certificate.subject = certificate.issuer = OpenSSL::X509::Name.parse("/CN=xcode-worker local import probe #{SecureRandom.hex(6)}")
+  certificate.public_key = csr.public_key
+  certificate.not_before = Time.now - 60
+  certificate.not_after = Time.now + 3600
+  extensions = OpenSSL::X509::ExtensionFactory.new
+  extensions.subject_certificate = certificate
+  extensions.issuer_certificate = certificate
+  certificate.add_extension(extensions.create_extension("basicConstraints", "CA:FALSE", true))
+  certificate.add_extension(extensions.create_extension("keyUsage", "digitalSignature", true))
+  certificate.add_extension(extensions.create_extension("extendedKeyUsage", "codeSigning"))
+  certificate.sign(key, OpenSSL::Digest::SHA256.new)
+  fingerprint = OpenSSL::Digest::SHA1.hexdigest(certificate.to_der).upcase
+  certificate_imported = false
+
+  Dir.mktmpdir("developer-id-keychain-probe-") do |directory|
+    certificate_path = File.join(directory, "probe.cer")
+    private_key_path = File.join(directory, "probe.p12")
+    File.binwrite(certificate_path, certificate.to_der)
+    File.open(private_key_path, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |file| file.write(key.to_pem) }
+
+    begin
+      # Cert::Runner writes a PEM key with a .p12 suffix. Import it with the
+      # same security flags; import the test certificate first for safe cleanup.
+      [certificate_path, private_key_path].each do |path|
+        FastlaneCore::KeychainImporter.import_file(path, SIGNING_KEYCHAIN_PATH, keychain_password: password)
+        found, _err, status = Open3.capture3("security", "find-certificate", "-Z", "-a", "-c", "xcode-worker local import probe", SIGNING_KEYCHAIN_PATH)
+        UI.user_error!("Local certificate import failed before Apple provisioning") unless status.success? && found.include?(fingerprint)
+        certificate_imported = true if path == certificate_path
+      end
+
+      UI.user_error!("Local test private key did not form an identity in the dedicated keychain") unless keychain_identity_present?(fingerprint, policy: "codesigning", valid_only: false)
+      _out, _err, status = Open3.capture3("security", "verify-cert", "-c", certificate_path, "-r", certificate_path, "-p", "codeSign", "-L")
+      UI.user_error!("Local test certificate/key chain cannot be verified") unless status.success?
+      executable = File.join(directory, "probe-executable")
+      FileUtils.cp("/usr/bin/true", executable)
+      _out, _err, status = Open3.capture3("codesign", "--force", "--sign", fingerprint,
+                                         "--keychain", SIGNING_KEYCHAIN_PATH, "--timestamp=none", executable)
+      UI.user_error!("Local test private key cannot be used by codesign headlessly") unless status.success?
+    ensure
+      if certificate_imported
+        _out, _err, removed = Open3.capture3("security", "delete-identity", "-Z", fingerprint, SIGNING_KEYCHAIN_PATH)
+        unless removed.success?
+          _out, _err, removed = Open3.capture3("security", "delete-certificate", "-Z", fingerprint, SIGNING_KEYCHAIN_PATH)
+        end
+        UI.user_error!("Could not remove the temporary local test identity; review the dedicated keychain") unless removed.success?
+        remaining, _err, _status = Open3.capture3("security", "find-certificate", "-Z", "-a", "-c", "xcode-worker local import probe", SIGNING_KEYCHAIN_PATH)
+        UI.user_error!("Temporary local test certificate remains in the dedicated keychain") if remaining.include?(fingerprint)
+        UI.user_error!("Temporary local test private key remains in the dedicated keychain") unless private_key_item_count == keys_before
+      end
+    end
+  end
+  UI.success("Headless fresh-key import, pairing, partition access, and Developer ID CA preflight passed")
+end
+
+lane :bootstrap_app do |options|
+  UI.user_error!("bundle_id is required") if options[:bundle_id].to_s.strip.empty?
+  bundle_id = validate_bundle_id!(options[:bundle_id])
+  unless development_app_ids.include?(bundle_id)
+    UI.user_error!("Add #{bundle_id} to #{OP_VAULT}/development-apps/bundle_ids in 1Password before running bootstrap_app")
+  end
+
+  Spaceship::ConnectAPI.token = connect_api_token(asc_credentials)
+  bundle = Spaceship::ConnectAPI::BundleId.all.find { |item| item.identifier == bundle_id }
+
+  if bundle
+    UI.success("Bundle ID already exists: #{bundle_id}")
+  else
+    UI.message("Creating Bundle ID #{bundle_id}")
+    bundle = Spaceship::ConnectAPI::BundleId.create(
+      name: bundle_id, platform: "UNIVERSAL", identifier: bundle_id
+    )
+    UI.success("Bundle ID created: #{bundle.identifier}")
+  end
+  sync_signing(readonly: false, app_ids: [bundle_id])
+end
+
+lane :list_development_apps do
+  development_app_ids.each { |id| UI.message(id) }
+end
+
+lane :sync_development_signing do |options|
+  sync_signing(readonly: false, certificate_id: options[:certificate_id])
+end
+
+lane :sync_development_signing_readonly do |options|
+  sync_signing(readonly: true, certificate_id: options[:certificate_id])
+end
+
+lane :reconcile_development_profiles do |options|
+  certificate_id = options[:certificate_id].to_s.strip
+  UI.user_error!("certificate_id is required; import and validate the replacement certificate first") if certificate_id.empty?
+  UI.user_error!("Invalid certificate_id") unless certificate_id.match?(/\A[A-Za-z0-9]+\z/)
+  sync_signing(readonly: false, certificate_id: certificate_id, force: true)
+end
+
+lane :signing_status do
+  now = Time.now.utc
+  canonical_certificate_metadata.each do |label, certificates|
+    UI.header(label)
+    certificates.each do |cert|
+      days = ((cert.fetch(:expires) - now) / 86_400).ceil
+      state = if now < cert.fetch(:valid_from)
+                "NOT YET VALID"
+              elsif now >= cert.fetch(:expires)
+                "EXPIRED"
+              elsif days <= CERTIFICATE_CRITICAL_DAYS
+                "CRITICAL"
+              elsif days <= CERTIFICATE_WARNING_DAYS
+                "WARNING"
+              else
+                "OK"
+              end
+      UI.message("canonical match | id=#{cert.fetch(:id)} | serial=#{cert.fetch(:serial)} | name=#{cert.fetch(:name)} | valid_from=#{cert.fetch(:valid_from).iso8601} | expires=#{cert.fetch(:expires).iso8601} | days=#{days} | #{state}")
+      UI.important("#{label} certificate #{cert.fetch(:id)} expires in #{days} days") if state == "WARNING" || state == "CRITICAL"
+      UI.important("#{label} certificate #{cert.fetch(:id)} has expired") if state == "EXPIRED"
+    end
+  end
+end
+
+lane :list_development_certificates do
+  signing_status
+end
+
+lane :sync_developer_id_application_readonly do
+  sync_developer_id(type: "developer_id")
+end
+
+lane :sync_developer_id_installer_readonly do
+  sync_developer_id(type: "developer_id_installer")
+end
+
+lane :provision_developer_id_signing do |options|
+  UI.user_error!("Run this Account Holder lane in an interactive terminal") unless $stdin.tty? && $stdout.tty?
+
+  classes = {
+    "Developer ID Application" => "developer_id",
+    "Developer ID Installer" => "developer_id_installer"
+  }
+  secrets = op_values(:match_password, :match_repository, :keychain_password, :asc_team_id)
+  pending_recovery = Dir[File.expand_path("~/.config/xcode-worker/developer-id-recovery-*/*.p12")]
+  unless pending_recovery.empty?
+    UI.user_error!("A Developer ID recovery key already exists at #{File.dirname(pending_recovery.first)}. Resolve it before requesting another Apple certificate.")
+  end
+  match_connection(secrets)
+  local_import_probe!(secrets.fetch(:keychain_password))
+  before = classes.to_h do |label, type|
+    state = canonical_developer_id_identity(type: type, common_name: label)
+    UI.message("#{label}: #{state == :present ? 'valid canonical identity already exists' : 'canonical identity missing'}")
+    [label, state]
+  end
+
+  if before.values.include?(:missing)
+    username = options[:username].to_s.strip
+    username = UI.input("Account Holder Apple ID: ").to_s.strip if username.empty?
+    UI.user_error!("Account Holder Apple ID is required") if username.empty?
+
+    with_interactive_apple_auth(team_id: secrets.fetch(:asc_team_id)) do
+      classes.each do |label, type|
+        next if before.fetch(label) == :present
+        UI.header("Provisioning #{label}")
+        provision_missing_developer_id_identity!(type: type, common_name: label,
+                                                 username: username, secrets: secrets)
+        state = canonical_developer_id_identity(type: type, common_name: label)
+        unless state == :present
+          UI.user_error!("#{label}: match import completed but readonly validation failed; Installer provisioning was stopped")
+        end
+        UI.success("#{label}: immediately validated through readonly match")
+      end
+    end
+  end
+
+  classes.each do |label, type|
+    state = canonical_developer_id_identity(type: type, common_name: label)
+    UI.user_error!("#{label}: final readonly validation failed") unless state == :present
+    UI.success("#{label}: #{before.fetch(label) == :present ? 'existing canonical identity retained' : 'new canonical identity validated'}")
+  end
+  UI.success("Canonical Developer ID Application and Installer identities are available from match")
+end
+
+lane :recover_developer_id_signing do |options|
+  type = options[:type].to_s
+  classes = { "developer_id" => "Developer ID Application",
+              "developer_id_installer" => "Developer ID Installer" }
+  common_name = classes[type]
+  UI.user_error!("type must be developer_id or developer_id_installer") unless common_name
+  certificate_id = options[:certificate_id].to_s.strip
+  UI.user_error!("certificate_id must be the existing Apple certificate ID") unless certificate_id.match?(/\A[A-Z0-9]+\z/)
+
+  recovery_root = File.realpath(File.expand_path("~/.config/xcode-worker"))
+  recovery_path = File.realpath(options[:recovery_path].to_s)
+  unless File.dirname(recovery_path) == recovery_root && File.basename(recovery_path).start_with?("developer-id-recovery-")
+    UI.user_error!("recovery_path must be a generated private directory under #{recovery_root}")
+  end
+  directory_stat = File.lstat(recovery_path)
+  UI.user_error!("Recovery directory must be owned and private") unless directory_stat.directory? && directory_stat.uid == Process.uid && (directory_stat.mode & 0o077).zero?
+  expected_files = %W[#{certificate_id}.cer #{certificate_id}.p12 #{certificate_id}.certSigningRequest]
+  UI.user_error!("Recovery directory must contain exactly the expected certificate, key, and CSR") unless Dir.children(recovery_path).sort == expected_files.sort
+  expected_files.each do |name|
+    file_stat = File.lstat(File.join(recovery_path, name))
+    UI.user_error!("Recovery file #{name} must be owned and private") unless file_stat.file? && file_stat.uid == Process.uid && (file_stat.mode & 0o077).zero?
+  end
+  certificate_path = File.join(recovery_path, "#{certificate_id}.cer")
+  private_key_path = File.join(recovery_path, "#{certificate_id}.p12")
+  certificate = OpenSSL::X509::Certificate.new(File.binread(certificate_path))
+  request = OpenSSL::X509::Request.new(File.binread(File.join(recovery_path, "#{certificate_id}.certSigningRequest")))
+  UI.user_error!("Recovery CSR does not match the issued certificate") unless request.public_key.public_to_der == certificate.public_key.public_to_der
+  fingerprint = OpenSSL::Digest::SHA1.hexdigest(certificate.to_der).upcase
+  secrets = op_values(:match_password, :match_repository, :asc_team_id, :keychain_password)
+  prepare_signing_keychain!(secrets.fetch(:keychain_password))
+  UI.user_error!("#{common_name}: canonical match already contains an identity; recovery will not overwrite it") unless canonical_developer_id_identity(type: type, common_name: common_name) == :missing
+  validate_local_developer_id_identity!(certificate_path, private_key_path, common_name, type)
+  import_developer_id_identity!(type: type, certificate_path: certificate_path,
+                                private_key_path: private_key_path, secrets: secrets,
+                                skip_certificate_matching: true)
+  UI.user_error!("#{common_name}: readonly match validation failed; recovery files retained") unless canonical_developer_id_identity(type: type, common_name: common_name, expected_fingerprint: fingerprint) == :present
+  FileUtils.remove_entry_secure(recovery_path)
+  UI.success("#{common_name} #{certificate_id}: existing identity stored and fetched readonly; recovery directory removed")
+end
+
+lane :preflight_developer_id_keychain do
+  local_import_probe!(op_values(:keychain_password).fetch(:keychain_password))
+end
