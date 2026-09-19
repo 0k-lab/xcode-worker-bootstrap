@@ -94,8 +94,6 @@ fi
 # Power daemon
 CAFFEINATE_LABEL="local.xcode-worker.caffeinate"
 CAFFEINATE_PLIST="/Library/LaunchDaemons/$CAFFEINATE_LABEL.plist"
-LEGACY_CAFFEINATE_LABEL="one.0777.xcode-worker.caffeinate"
-LEGACY_CAFFEINATE_PLIST="/Library/LaunchDaemons/$LEGACY_CAFFEINATE_LABEL.plist"
 
 if [[ -f "$CAFFEINATE_PLIST" ]] &&
    [[ "$(plutil -extract Label raw -o - "$CAFFEINATE_PLIST" 2>/dev/null)" == "$CAFFEINATE_LABEL" ]]; then
@@ -108,13 +106,6 @@ if launchctl print "system/$CAFFEINATE_LABEL" 2>/dev/null | grep -q 'state = run
   pass "generic caffeinate LaunchDaemon running"
 else
   fail "generic caffeinate LaunchDaemon not running"
-fi
-
-if launchctl print "system/$LEGACY_CAFFEINATE_LABEL" >/dev/null 2>&1 ||
-   [[ -e "$LEGACY_CAFFEINATE_PLIST" || -L "$LEGACY_CAFFEINATE_PLIST" ]]; then
-  fail "legacy caffeinate LaunchDaemon still installed or loaded"
-else
-  pass "legacy caffeinate LaunchDaemon absent"
 fi
 
 if pgrep -x caffeinate >/dev/null 2>&1; then

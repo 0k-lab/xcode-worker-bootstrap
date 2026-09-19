@@ -129,7 +129,47 @@ fi
 
 # caffeinate LaunchDaemon
 echo "==> Installing caffeinate LaunchDaemon"
-sudo "$ROOT/migrate-caffeinate-launchd.sh"
+CAFFEINATE_LABEL="local.xcode-worker.caffeinate"
+CAFFEINATE_PLIST="/Library/LaunchDaemons/$CAFFEINATE_LABEL.plist"
+CAFFEINATE_SOURCE="$ROOT/launchd/$CAFFEINATE_LABEL.plist"
+
+if ! plutil -lint "$CAFFEINATE_SOURCE" >/dev/null ||
+   [[ "$(plutil -extract Label raw -o - "$CAFFEINATE_SOURCE" 2>/dev/null)" != "$CAFFEINATE_LABEL" ]]; then
+  echo "ERROR: Repository caffeinate LaunchDaemon plist is invalid."
+  exit 1
+fi
+
+if [[ -e "$CAFFEINATE_PLIST" || -L "$CAFFEINATE_PLIST" ]]; then
+  if [[ ! -f "$CAFFEINATE_PLIST" || -L "$CAFFEINATE_PLIST" ]] ||
+     [[ "$(stat -f %u "$CAFFEINATE_PLIST")" != 0 ]] ||
+     [[ "$(plutil -extract Label raw -o - "$CAFFEINATE_PLIST" 2>/dev/null)" != "$CAFFEINATE_LABEL" ]] ||
+     [[ "$(plutil -extract ProgramArguments.0 raw -o - "$CAFFEINATE_PLIST" 2>/dev/null)" != "/usr/bin/caffeinate" ]] ||
+     [[ "$(plutil -extract ProgramArguments.1 raw -o - "$CAFFEINATE_PLIST" 2>/dev/null)" != "-s" ]] ||
+     [[ "$(plutil -extract ProgramArguments.2 raw -o - "$CAFFEINATE_PLIST" 2>/dev/null)" != "-i" ]] ||
+     plutil -extract ProgramArguments.3 raw -o - "$CAFFEINATE_PLIST" >/dev/null 2>&1; then
+    echo "ERROR: caffeinate LaunchDaemon path contains an unexpected job."
+    exit 1
+  fi
+fi
+
+existing_caffeinate_job="$(sudo launchctl print "system/$CAFFEINATE_LABEL" 2>/dev/null || true)"
+if [[ -n "$existing_caffeinate_job" ]] &&
+   ! grep -Fq "path = $CAFFEINATE_PLIST" <<< "$existing_caffeinate_job"; then
+  echo "ERROR: caffeinate LaunchDaemon label is loaded from an unexpected path."
+  exit 1
+fi
+
+sudo install -o root -g wheel -m 644 "$CAFFEINATE_SOURCE" "$CAFFEINATE_PLIST"
+sudo plutil -lint "$CAFFEINATE_PLIST"
+if [[ -n "$existing_caffeinate_job" ]]; then
+  sudo launchctl bootout "system/$CAFFEINATE_LABEL"
+fi
+sudo launchctl bootstrap system "$CAFFEINATE_PLIST"
+new_caffeinate_job="$(sudo launchctl print "system/$CAFFEINATE_LABEL" 2>/dev/null || true)"
+if [[ "$new_caffeinate_job" != *"state = running"* ]]; then
+  echo "ERROR: caffeinate LaunchDaemon did not start."
+  exit 1
+fi
 
 # Power configuration
 echo "==> Configuring power management"

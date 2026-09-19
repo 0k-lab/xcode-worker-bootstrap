@@ -1,63 +1,172 @@
-# Headless Xcode worker reference implementation
+# xcode-worker-bootstrap
 
-This repository is a reproducible reference for a dedicated, headless Apple Silicon macOS/Xcode worker. It combines Homebrew, Fastlane Match, a scoped 1Password Service Account, a dedicated signing keychain, Tailscale, and clean-Mac recovery. The Fastlane lanes manage Apple Development profiles and self-managed Developer ID Application and Installer identities; certificate expiry is monitored from canonical encrypted match storage. App Store production signing and delivery remain outside this repository and can be owned independently by Xcode Cloud.
+![macOS / Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-222?logo=apple) [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-The goal is to take a clean Apple Silicon Mac and restore it to a state where:
+Reproducible headless macOS/Xcode worker with Fastlane Match, 1Password-backed secrets, Developer ID signing, Tailscale, and clean-Mac recovery.
 
-- it boots and remains available unattended with the lid closed;
-- SSH and Screen Sharing are available;
-- Tailscale is available before GUI login;
-- Xcode and the required Simulator runtime are installed;
-- Codex can execute development tasks;
-- iOS development signing works without manual Developer Portal interaction;
-- Time Machine backs up persistent state while excluding disposable Xcode data;
-- `./verify.sh` completes with zero failures.
+A dedicated Xcode Mac is easy to configure by hand and hard to rebuild after loss: signing keys, profiles, login keychains, remote access, and certificate expiry become implicit machine state. This reference project makes those dependencies documented and bootstrapable. It has been validated on a real Apple Silicon worker, including cold reboot without GUI login and readonly signing recovery.
 
-## Prerequisites and target state
+## Architecture
 
-Provide your own Apple Developer team, App Store Connect API key, private Git repository for encrypted match storage, 1Password vault and read-only Service Account, Git credentials for the private match repository, and Tailscale account. Install Xcode and a compatible iOS Simulator runtime manually. An Apple Developer Account Holder must be available for rare interactive Developer ID provisioning. The optional Time Machine destination and remote-access policy are yours to configure.
+```mermaid
+flowchart LR
+    OP["1Password vault<br/>configuration and automation credentials"] -->|"scoped read-only Service Account"| W["xcode-worker<br/>Fastlane + dedicated keychain"]
+    W -->|"Bundle IDs, certificates, profiles<br/>administrative operations"| A["Apple Developer services"]
+    W <-->|"encrypted canonical identities<br/>and development profiles"| M["Private Match Git repository"]
+    M -->|"readonly recovery"| C["Future consumers<br/>for example GitHub Actions"]
+    XC["Xcode Cloud"] -->|"independent App Store signing<br/>and delivery"| A
+```
 
-Reference configuration:
+The **public repository** holds bootstrap and verification code. The **private Match repository** holds encrypted self-managed signing assets. The worker imports those assets into its dedicated runtime keychain. Xcode Cloud can own App Store production signing and delivery independently.
 
-- Hostname: `xcode-worker`
-- User: `worker`
-- macOS: 27.0 (26A428)
-- Xcode: 27.0 (27A266a)
-- Swift: 6.4
-- iOS Simulator runtime: 27.0
-- Apple Silicon
-- FileVault: disabled for the unattended boot model described here
-- Remote Login: enabled
-- Screen Sharing: enabled
-- Tailscale: CLI `tailscaled` system service
-- Codex: authenticated with ChatGPT
-- Development signing: fastlane match + dedicated automation keychain
-- Time Machine: network backup to NAS
+## What it provides
 
-Versions above describe one tested worker; choose compatible versions for your installation. The scripts use `worker` as the default account name and `xcode-worker` as the default host name. Set `XCODE_WORKER_USER` and `XCODE_WORKER_HOSTNAME` when using different names. The dedicated keychain and local token path remain named `xcode-worker` for consistency across installations.
+| Capability | How this reference handles it |
+| --- | --- |
+| Rebuild a worker | Homebrew tooling, system `tailscaled`, power settings, signing keychain, and Time Machine exclusions are bootstrapable. |
+| Work without GUI login | SSH/Tailscale and the caffeinate LaunchDaemon survive a cold reboot. |
+| Recover signing | Readonly Match lanes restore Apple Development profiles and Developer ID Application/Installer identities. |
+| Administer signing | Declarative Bundle IDs, explicit write lanes, Account Holder provisioning, and partial-failure recovery. |
+| Detect expiry | `fastlane signing_status` reads canonical Match certificates; warnings start at 90 days and critical status at 30 days. |
 
-Before running bootstrap, choose your worker account and host name, create the 1Password schema in section 9, grant the worker Git access to its private match repository, and set `XCODE_WORKER_OP_VAULT` if using a different vault name. The account and host variables are ordinary, non-secret environment settings; the Apple Team ID, match URL, Bundle IDs, and credentials are read from 1Password at runtime. No Fastfile or Matchfile source edit is needed.
+## Trust and secret boundaries
 
-## Repository contents
+The only persistent **local Apple bootstrap credential** is a scoped 1Password Service Account token at `~/.config/xcode-worker/1password-service-account-token`. The worker also retains imported signing identities in `~/Library/Keychains/xcode-worker.keychain-db`; those are runtime copies, while the encrypted private Match repository is canonical. The worker needs separate Git access to that private repository.
+
+| Location | Responsibility |
+| --- | --- |
+| 1Password | ASC API key, Team ID, private Match URL and encryption password, dedicated keychain password, development Bundle ID inventory. |
+| Private Match Git repository | Canonical Apple Development, Developer ID Application, and Developer ID Installer identities; development provisioning profiles. |
+| Worker keychain | Runtime identities recovered from Match. |
+| Account Holder | Interactive Apple ID password/2FA only for exceptional Developer ID provisioning; this repository does not persist them. |
+
+Normal signing consumers use **readonly Match**. No persistent ASC `.p8` file is created: the private key is read from 1Password and reconstructed in memory. See [Security](#security) and [SECURITY.md](SECURITY.md).
+
+### 1Password schema
+
+Create these items and fields in the `automation-apple` vault:
+
+```text
+automation-apple/
+├── app-store-connect
+│   ├── key_id
+│   ├── issuer_id
+│   ├── team_id
+│   └── private_key
+├── fastlane-match
+│   ├── password
+│   └── repository
+├── xcode-worker-keychain
+│   └── password
+└── development-apps
+    └── bundle_ids
+```
+
+Use `XCODE_WORKER_OP_VAULT` for another vault name. `bundle_ids` is one Bundle ID per line (for example, `com.example.MyApp`). `private_key` is the **one-line base64 body** of an ASC `.p8` EC private key, without PEM markers. `repository` is a private SSH Git URL or HTTPS Git URL without embedded credentials. The [configuration guide](#1password-access-and-configuration) covers each field.
+
+## Quick start
+
+### Prerequisites
+
+- Apple Silicon Mac with a compatible macOS and Xcode installation, plus the required iOS Simulator runtime. The tested reference used macOS 27.0 and Xcode 27.0; the scripts do not pin those versions.
+- Apple Developer Program team and ASC API key; an Account Holder is needed only for exceptional Developer ID provisioning.
+- Homebrew installed at `/opt/homebrew`, a 1Password vault and scoped **read-only** Service Account, and Git access to your **private** Match repository.
+- Tailscale account for the documented remote-access setup. Configure Remote Login and Screen Sharing in macOS. A Time Machine destination is optional.
+
+### Bootstrap and restore
+
+1. Create the worker account (default `worker`), install Xcode and Homebrew, and [prepare macOS](#prepare-macos). Create the 1Password schema above and grant the worker Git access to your private Match repository.
+2. Clone and enter this public repository:
+
+   ```bash
+   git clone https://github.com/0k-lab/xcode-worker-bootstrap.git ~/Developer/xcode-worker-bootstrap
+   cd ~/Developer/xcode-worker-bootstrap
+   ```
+
+3. Obtain the scoped Service Account token from your 1Password administrator. Review and run the bootstrap script; it prompts privately for the token if no token file or `OP_SERVICE_ACCOUNT_TOKEN` is present:
+
+   ```bash
+   ./bootstrap.sh
+   ```
+
+4. Finish the [manual Xcode](#install-xcode), [remote access](#configure-remote-access), [Tailscale](#configure-tailscale), Git, and optional Time Machine steps. Authenticate Tailscale and Codex separately.
+5. Recover the canonical signing material **readonly**, then verify:
+
+   ```bash
+   fastlane sync_development_signing_readonly
+   fastlane sync_developer_id_application_readonly
+   fastlane sync_developer_id_installer_readonly
+   ./verify.sh
+   ```
+
+   The Developer ID readonly lanes require their identities to have been provisioned in Match already. On a new setup without them, use the [explicit administrative flow](#developer-id-canonical-assets) when needed. `./verify.sh` checks the configured worker, not just repository syntax; see [verification](#verification).
+
+The defaults are user `worker`, host `xcode-worker`, and vault `automation-apple`. Set `XCODE_WORKER_USER`, `XCODE_WORKER_HOSTNAME`, and `XCODE_WORKER_OP_VAULT` as appropriate. The keychain and token path retain the `xcode-worker` name. No source edit is needed for your Team ID, Match URL, or Bundle IDs.
+
+## Command guide
+
+Run Fastlane commands from the repository root. **Readonly** means no Apple Developer or canonical Match write; some lanes unlock or import identities into the *local* dedicated keychain.
+
+| Normal or readonly command | Effect |
+| --- | --- |
+| `fastlane signing_status` | Reads encrypted canonical Match certificates and reports expiry. |
+| `fastlane list_development_apps` | Reads and validates the 1Password Bundle ID inventory. |
+| `fastlane preflight_developer_id_keychain` | Local-only import/signing probe; normalizes the user keychain search list and creates/removes a temporary test identity. |
+| `fastlane sync_development_signing_readonly` | Restores Apple Development identity and declared profiles from Match. Accepts optional `certificate_id:<id>`. |
+| `fastlane sync_developer_id_application_readonly` | Restores and validates the Application identity from Match. |
+| `fastlane sync_developer_id_installer_readonly` | Restores and validates the Installer identity, including disposable package signing. |
+| `./verify.sh` | Checks worker configuration; exits nonzero on failures. |
+
+| Administrative command | Possible write |
+| --- | --- |
+| `fastlane bootstrap_app bundle_id:com.example.NewApp` | May create the Apple Bundle ID, development identity/profile, and Match assets. The ID must first be in 1Password. |
+| `fastlane sync_development_signing` | May create an Apple Development identity/profile and write Match. |
+| `fastlane reconcile_development_profiles certificate_id:<existing-id>` | Forces profile regeneration for all declared IDs and writes Apple/Match state. |
+| `fastlane provision_developer_id_signing` | Interactive Account Holder flow; may issue missing Developer ID certificates and write Match. |
+| `fastlane recover_developer_id_signing type:developer_id certificate_id:<existing-id> recovery_path:<absolute-path>` | Imports an already issued Application pair into Match; use `type:developer_id_installer` for Installer. Does not request a new Apple certificate. |
+
+These write lanes are **manual administration**, never worker startup steps. The [signing administration guide](#signing-administration) explains certificate selection, rotation, and failure handling.
+
+## Signing lifecycle and recovery
+
+**Apple Development** uses ASC API operations where supported. The 1Password Bundle ID inventory drives profile reconciliation, and the certificate, private key, and profiles live canonically in Match. **Developer ID Application** signs macOS apps distributed outside the App Store. **Developer ID Installer** signs packages; its validation uses actual `productsign` and `pkgutil --check-signature`, plus certificate/key and chain checks. `signing_status` reads canonical Match state, with warning at 90 days and critical at 30 days before expiry.
+
+If the worker dies, install macOS/Xcode/Homebrew on a new Mac, clone this repository, supply a replacement or recovered scoped Service Account token, run `./bootstrap.sh`, restore from Match through the readonly lanes, and run `./verify.sh`. Re-enable SSH/Tailscale and test a cold reboot without GUI login. Operators do not need to find old `.p12` or `.p8` files; the canonical `.p12` material is encrypted in private Match, and the ASC key body is in 1Password. See the [full recovery checklist](#recover-a-lost-worker).
+
+If Apple has issued a Developer ID certificate but a later validation or Match import fails, the provisioning lane leaves a private `~/.config/xcode-worker/developer-id-recovery-*` directory containing the issued certificate, CSR, and key. **Do not request another certificate immediately.** Diagnose the error and use `recover_developer_id_signing` with the existing certificate ID and absolute directory path. It validates the pair, imports it into Match, validates readonly recovery, then removes the directory. Treat any retained directory as sensitive key material; the pattern is Git-ignored. See [Developer ID canonical assets](#developer-id-canonical-assets).
+
+Xcode Cloud can independently manage App Store distribution certificates, production profiles, and TestFlight/App Store delivery. This repository owns self-managed development and Developer ID signing; keeping those roles separate avoids duplicating production distribution assets.
+
+## Scope
+
+This is a concrete worker reference, not generic fleet management or arbitrary CI orchestration. It does not own App Store production delivery, replace Xcode Cloud, publish the private Match repository, or automate Account Holder password/2FA. GitHub Actions or other consumers may later use the canonical signing material **readonly**.
+
+## Repository map
 
 ```text
 .
-├── Brewfile
-├── bootstrap.sh
-├── migrate-caffeinate-launchd.sh
+├── bootstrap.sh                 # Host setup; run explicitly on a new worker
+├── verify.sh                    # Worker acceptance checks
+├── Brewfile                     # Homebrew and npm tooling
+├── fastlane/
+│   ├── Fastfile                 # Readonly and administrative signing lanes
+│   └── Matchfile                # Git storage, readonly by default
 ├── launchd/
 │   └── local.xcode-worker.caffeinate.plist
-├── fastlane/
-│   ├── Fastfile
-│   └── Matchfile
-└── verify.sh
+└── SECURITY.md                  # Private vulnerability reporting guidance
 ```
 
-Secrets are intentionally not stored in this repository.
+Existing installations with a separately installed caffeinate job should retire that job through their own host administration after confirming the generic daemon is running. The public bootstrap manages only `local.xcode-worker.caffeinate`.
 
 This reference implementation is licensed under the [MIT License](LICENSE).
 
-## 1. Prepare macOS
+## Detailed setup and operations
+
+The sections below preserve the operational runbook, including macOS setup, signing administration, rotation, and recovery checks.
+
+Tested reference configuration: Apple Silicon; macOS 27.0 (26A428); Xcode 27.0 (27A266a); Swift 6.4; iOS Simulator 27.0; user `worker`; host `xcode-worker`; Remote Login and Screen Sharing enabled; Homebrew `tailscaled` system service; ChatGPT-authenticated Codex; and an optional network Time Machine destination. These versions describe one worker, not enforced compatibility limits. The described unattended boot model disables FileVault so no pre-boot disk unlock is required; make that decision for your own physical and backup security model.
+
+### Prepare macOS
 
 Create an administrator account:
 
@@ -76,7 +185,7 @@ sudo scutil --set HostName xcode-worker
 
 This reference disables FileVault to allow unattended boot without a local pre-boot disk unlock. Decide whether that trade-off is appropriate for your physical and backup security model.
 
-## 2. Install Xcode
+### Install Xcode
 
 Install the required Xcode version manually.
 
@@ -117,7 +226,7 @@ xcrun simctl list runtimes
 
 Do not depend on a fixed Simulator UDID. Simulator identifiers are machine-local and may change after recovery.
 
-## 3. Install Homebrew
+### Install Homebrew
 
 Install Homebrew using its official installer.
 
@@ -140,7 +249,7 @@ Expected:
 /opt/homebrew/bin/brew
 ```
 
-## 4. Clone this repository
+### Clone this repository
 
 Clone this repository to:
 
@@ -154,7 +263,7 @@ Then:
 cd ~/Developer/xcode-worker-bootstrap
 ```
 
-## 5. Run automated bootstrap
+### Run automated bootstrap
 
 Review `bootstrap.sh` before running it.
 
@@ -170,7 +279,7 @@ It installs the Homebrew dependencies, dedicated automation keychain, power-mana
 
 Some configuration intentionally remains manual.
 
-## 6. Configure remote access
+### Configure remote access
 
 In:
 
@@ -197,7 +306,7 @@ ssh <worker-user>@<worker-hostname>.local
 
 Screen Sharing should also be tested before relying on the worker remotely.
 
-## 7. Configure Tailscale
+### Configure Tailscale
 
 This worker must use the Homebrew CLI/system-service variant of Tailscale, not `Tailscale.app`.
 
@@ -241,7 +350,7 @@ ssh <your-tailscale-hostname>
 
 A successful connection proves unattended Tailscale startup.
 
-## 8. Power management
+### Power management
 
 The worker is configured to remain operational on AC power while allowing normal battery sleep behavior.
 
@@ -275,13 +384,7 @@ using:
 /Library/LaunchDaemons/local.xcode-worker.caffeinate.plist
 ```
 
-Bootstrap runs the narrow migration helper to validate any previously installed legacy caffeinate job, start the generic replacement, then remove only that validated legacy job and plist. The helper is safe to rerun independently, without full bootstrap:
-
-```bash
-sudo ./migrate-caffeinate-launchd.sh
-```
-
-`./verify.sh` checks the new job is running and the old job is absent.
+Bootstrap installs and starts this generic job. `./verify.sh` checks that it is installed and running. If upgrading a host with another caffeinate job, remove the older job after checking that this one runs; the public bootstrap does not identify or modify unrelated launchd jobs.
 
 Verify:
 
@@ -295,7 +398,7 @@ Expected caffeinate assertions:
 - `PreventSystemSleep`
 - `PreventUserIdleSystemSleep`
 
-## 9. Restore 1Password access
+### 1Password access and configuration
 
 1Password is the source of truth for Apple automation secrets and Match connection settings. Create a scoped Service Account with **read-only access to only your automation vault**. The default vault name is `automation-apple`; set `XCODE_WORKER_OP_VAULT` to use another simple vault name (letters, digits, dots, underscores, or hyphens). This is non-secret local configuration, so set it in your shell startup and in any automation process environment. Provision or recover the Service Account token through a trusted administrator. The only persistent local Apple bootstrap credential is:
 
@@ -330,7 +433,7 @@ automation-apple/
 
 The `repository` field is a private SSH Git URL such as `git@github.com:example/apple-signing.git`, or an HTTPS Git URL without embedded credentials. The `team_id` field contains your own 10-character Apple Team ID (conceptually `TEAMID1234`). The `bundle_ids` field contains one ID per line, such as `com.example.MyApp`. The `private_key` field contains only the one-line base64 body of your ASC `.p8` EC private key, without PEM markers. Fastfile reconstructs and validates its PEM form in memory. Bootstrap and Fastlane read required values through `op`; no local ASC config or private key file is needed. Do not add duplicate items to supply Match settings.
 
-## 10. Restore automation signing
+### Restore automation signing
 
 Automation signing is managed by fastlane match.
 
@@ -382,9 +485,9 @@ Xcode Cloud independently owns App Store distribution certificates, production p
 
 `./verify.sh` checks that the dedicated keychain and every user keychain search-list entry resolve to existing keychain files. A stale search-list path can prevent macOS from finding the Developer ID CA chain even when a certificate and private key are present.
 
-## 11. Signing administration
+### Signing administration
 
-### Declarative development inventory
+#### Declarative development inventory
 
 `op://<vault>/development-apps/bundle_ids` is the canonical list. Store one Bundle ID per line, for example:
 
@@ -421,7 +524,7 @@ fastlane sync_development_signing
 
 This write lane may create a missing Apple Development identity and create or update profiles. It is not a rotation command and must not run at worker startup.
 
-### Certificate status and expiry
+#### Certificate status and expiry
 
 ```bash
 fastlane signing_status
@@ -429,7 +532,7 @@ fastlane signing_status
 
 This readonly lane clones canonical match storage into a private temporary directory and decrypts only the stored `.cer` files with Fastlane's match encryption code. It never decrypts or imports private keys. It reports common name, match certificate ID, serial, validity start, expiration, days remaining, and status for Apple Development, Developer ID Application, and Developer ID Installer. Match's certificate filename provides the portal ID when the pair was stored under that ID; the serial comes from the certificate itself. A matching encrypted `.p12` must be present; use the readonly sync lanes to validate its key and signing ability. The clone and decrypted public certificates are removed afterward. It warns at 90 days, marks 30 days or less as critical, and reports expired certificates clearly. The ASC API can omit Developer ID Installer, so portal visibility is complementary to this canonical match report. The older `list_development_certificates` lane is an alias.
 
-### Developer ID canonical assets
+#### Developer ID canonical assets
 
 Match type `developer_id` stores **Developer ID Application** in `certs/developer_id_application`; it does not include Installer. Match type `developer_id_installer` stores **Developer ID Installer** in `certs/developer_id_installer`. Neither type needs provisioning profiles for the current external signing use case.
 
@@ -481,7 +584,7 @@ The code signing policy must show Developer ID Application; the basic policy mus
 
 If Apple or Fastlane cannot create a missing class, stop and diagnose the failure; manually importing a partial identity is not the acceptance path. An old portal certificate with a lost key cannot be reused. If Apple's certificate limit blocks creation, identify the affected old certificate with the Account Holder in the Developer portal and decide its retirement manually; the lane never revokes it or uses `match nuke`.
 
-### Rotation policy
+#### Rotation policy
 
 Rotation is explicit administrator work. Fastlane 2.240.1 match uses an existing stored certificate and does not provide a safe scoped replacement operation that creates and validates a new identity while retaining the old one. Its `renew_expired_certs` path can remove the stored old pair before creating a new one. All lanes here set that option to `false`. `provision_developer_id_signing` fills missing canonical identities; it does not rotate a stored one.
 
@@ -489,7 +592,7 @@ For Apple Development, an administrator must create a replacement with an export
 
 For Developer ID Application and Installer, the Account Holder creates a replacement certificate and exportable private key through the Apple Developer website or Xcode, then imports the matching pair with the corresponding match type above. Test each readonly lane and the intended signing operation before retiring the old identity. Apple limits Developer ID certificate slots; if full, arrange a deliberate targeted retirement through the Account Holder after checking downstream consumers. Never use `match nuke` or revoke an old certificate before its replacement is stored and validated.
 
-## 12. Install and authenticate Codex
+### Install and authenticate Codex
 
 Codex is installed through npm/Homebrew Node:
 
@@ -513,7 +616,7 @@ Reference config:
 
 Set the agent's permissions to suit your trust model. Any coding agent running as the worker user can access that user's local signing and 1Password bootstrap material; do not store unrelated personal credentials on this machine.
 
-## 13. Git/GitHub access
+### Git/GitHub access
 
 Configure Git identity as required.
 
@@ -553,7 +656,7 @@ unset -f worker_op
 
 This direct import is an explicit administrative write operation. The normal Fastfile lanes read the same fields through their centralized adapter and do not need these manual variables.
 
-## 14. Time Machine
+### Time Machine
 
 Configure the NAS Time Machine destination manually in macOS.
 
@@ -582,7 +685,7 @@ tmutil isexcluded \
 
 Run and complete an initial backup.
 
-## 15. GUI cleanup
+### GUI cleanup
 
 This is a dedicated worker, not a personal Mac.
 
@@ -606,7 +709,7 @@ Recommended state:
 
 Keep the Apple Account signed in where required for the Apple development ecosystem.
 
-## 16. Time Machine is not the recovery strategy
+### Recover a lost worker
 
 Time Machine is useful for fast restoration, but this repository plus separately backed-up secrets should be sufficient to reconstruct the worker.
 
@@ -632,7 +735,7 @@ clean macOS
 
 The Apple Development certificate and private key do not require a separate `.p12` recovery backup. Their canonical encrypted copy is stored in the private fastlane match repository.
 
-## 17. Verification
+### Verification
 
 Run:
 
@@ -660,7 +763,7 @@ On the reference worker, a cold reboot without GUI login restored SSH/Tailscale 
 8. verify the automation signing identity;
 9. run an Xcode build/test smoke test.
 
-## Secrets that must be backed up separately
+### Secrets that must be backed up separately
 
 Do not commit these to this repository:
 
@@ -672,10 +775,14 @@ The Apple Development certificate and its private key are intentionally stored e
 
 Codex ChatGPT authentication and Tailscale authentication can normally be recreated interactively.
 
-## Security boundary
+## Security
 
 Treat coding agents and automation jobs as code running with the privileges of the worker account.
 
-The automation signing keychain and 1Password Service Account token are high-value credentials. Access should be limited to the dedicated worker account and trusted automation. Revoke the Service Account token in 1Password if the worker is compromised; issue a replacement and reprovision its local token file.
+Never commit a 1Password Service Account token, ASC private key, Match encryption password, or recovered certificate/private key. Keep the Match repository private. Scope the Service Account to read-only access to only the automation vault, and use readonly Match lanes for normal consumers. Recovery directories contain sensitive key material even though they are Git-ignored. Account Holder login is exceptional interactive administrative access, not a worker credential.
+
+The automation signing keychain and 1Password Service Account token are high-value credentials. Access should be limited to the dedicated worker account and trusted automation. Revoke the Service Account token in 1Password if the worker is compromised; issue a replacement and reprovision its local token file. Rotate or revoke any exposed credentials. Removing a secret from HEAD does not remove it from Git history.
 
 Keep this Mac dedicated to development automation and avoid storing unrelated personal or production credentials on it.
+
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
