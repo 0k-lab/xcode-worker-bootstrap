@@ -4,7 +4,7 @@ The worker reads automation settings from 1Password; see [setup](setup.md) for i
 
 ## 1Password access and configuration
 
-1Password is the source of truth for Apple automation secrets and Match connection settings. Create a scoped Service Account with **read-only access to only your automation vault**. The default vault name is `automation-apple`; set `XCODE_WORKER_OP_VAULT` to use another simple vault name (letters, digits, dots, underscores, or hyphens). This is non-secret local configuration, so set it in your shell startup and in any automation process environment. Provision or recover the Service Account token through a trusted administrator. The only persistent local Apple bootstrap credential is:
+1Password is the source of truth for Apple automation secrets and Match connection settings. Create a scoped Service Account with **read-only access to only your automation vault**. The default vault name is `automation-apple`; set `XCODE_WORKER_OP_VAULT` to use another simple vault name (letters, digits, dots, underscores, or hyphens). This is non-secret local configuration, so set it in your shell startup and in any automation process environment. Obtain a valid scoped Service Account token through a trusted administrator. The only persistent local Apple bootstrap credential is:
 
 ```text
 ~/.config/xcode-worker/1password-service-account-token
@@ -29,13 +29,40 @@ For the default vault, the schema is:
 
 ```text
 automation-apple/
-├── app-store-connect/{key_id,issuer_id,team_id,private_key}
-├── fastlane-match/{password,repository}
-├── xcode-worker-keychain/password
-└── development-apps/bundle_ids
+├── app-store-connect
+│   ├── key_id
+│   ├── issuer_id
+│   ├── team_id
+│   └── private_key
+├── fastlane-match
+│   ├── password
+│   └── repository
+├── xcode-worker-keychain
+│   └── password
+└── development-apps
+    └── bundle_ids
 ```
 
 The `repository` field is a private SSH Git URL such as `git@github.com:example/apple-signing.git`, or an HTTPS Git URL without embedded credentials. The `team_id` field contains your own 10-character Apple Team ID (conceptually `TEAMID1234`). The `bundle_ids` field contains one ID per line, such as `com.example.MyApp`. The `private_key` field contains only the one-line base64 body of your ASC `.p8` EC private key, without PEM markers. Fastfile reconstructs and validates its PEM form in memory. Bootstrap and Fastlane read required values through `op`; no local ASC config or private key file is needed. Do not add duplicate items to supply Match settings.
+
+### Logical naming convention
+
+The logical hierarchy is `<scope>/<item>/<field>`, independent of its storage backend. A **scope** groups one automation or security domain (here, the `automation-apple` vault); an **item** groups one logical system, credential set, or resource; a **field** is one atomic value with a stable semantic name.
+
+- Group related values in one item instead of creating one item per field. Keep secret values and non-secret configuration together when they belong to the same resource: `team_id` and `private_key` both belong under `app-store-connect`.
+- Prefer stable semantic names over provider-specific names. Do not encode environments, machines, users, or values into field names unless they are part of the logical identity.
+- In a future provider abstraction, consumers would request logical references and an adapter would resolve them through a backend. Keep the hierarchy straightforward to map elsewhere.
+
+This is an **illustrative mapping**, not a selected OpenBao layout:
+
+```text
+1Password:                op://automation-apple/app-store-connect/key_id
+Logical reference:        automation-apple/app-store-connect/key_id
+Possible OpenBao mapping: <mount>/automation-apple/app-store-connect
+                          key_id = ...
+```
+
+1Password is the **current** backend: bootstrap and Fastlane still read it directly. Backend portability is a design direction, not an implemented feature; OpenBao is not currently supported here. These names aim to make later 1Password-to-OpenBao backup or synchronization, migration to another secrets backend, or a provider adapter easier without changing the logical references.
 
 ## Direct administrative Match import environment
 

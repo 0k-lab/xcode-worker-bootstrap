@@ -5,7 +5,7 @@ Time Machine can speed up restoration, but this procedure reconstructs a worker 
 ## Clean Mac checklist
 
 1. Install macOS, create the dedicated worker administrator account, set the hostname, install Xcode and the required iOS Simulator runtime, and install Homebrew. Follow [setup](setup.md#prepare-macos) and its Xcode and Homebrew sections. Decide whether the documented FileVault trade-off is appropriate before depending on unattended boot.
-2. Clone this repository to `~/Developer/xcode-worker-bootstrap` and run `./bootstrap.sh`. Provision a recovered or replacement scoped read-only 1Password Service Account token through bootstrap; keep the vault items and private Match Git access available. See [configuration](configuration.md#1password-access-and-configuration).
+2. Clone this repository to `~/Developer/xcode-worker-bootstrap` and run `./bootstrap.sh`. Supply a valid scoped read-only 1Password Service Account token through bootstrap; keep the vault items and private Match Git access available. See [configuration](configuration.md#1password-access-and-configuration).
 3. Authenticate GitHub with `gh auth login` and confirm `git ls-remote <your-private-match-Git-URL>` succeeds. Restore signing through the readonly lanes below. The Developer ID lanes require those identities to have been provisioned canonically in Match; use [Developer ID provisioning](developer-id.md#developer-id-canonical-assets) only if genuinely missing.
 
    ```bash

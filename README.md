@@ -38,7 +38,7 @@ The only persistent **local Apple bootstrap credential** is a scoped 1Password S
 | 1Password | ASC API key, Team ID, private Match URL and encryption password, dedicated keychain password, development Bundle ID inventory. |
 | Private Match Git repository | Canonical Apple Development, Developer ID Application, and Developer ID Installer identities; development provisioning profiles. |
 | Worker keychain | Runtime identities recovered from Match. |
-| Account Holder | Interactive Apple ID password/2FA only for exceptional Developer ID provisioning; this repository does not persist them. |
+| Account Holder | Interactive Apple ID password/2FA only for explicit administrative Developer ID provisioning; this repository does not persist them. |
 
 Normal signing consumers use **readonly Match**. No persistent ASC `.p8` file is created: the private key is read from 1Password and reconstructed in memory. See [Security](#security-and-license) and [SECURITY.md](SECURITY.md).
 
@@ -69,7 +69,7 @@ Use `XCODE_WORKER_OP_VAULT` for another vault name. `bundle_ids` is one Bundle I
 ### Prerequisites
 
 - Apple Silicon Mac with a compatible macOS and Xcode installation, plus the required iOS Simulator runtime. The tested reference used macOS 27.0 and Xcode 27.0; the scripts do not pin those versions.
-- Apple Developer Program team and ASC API key; an Account Holder is needed only for exceptional Developer ID provisioning.
+- Apple Developer Program team and ASC API key; Account Holder access is required only for explicit administrative Developer ID provisioning.
 - Homebrew installed at `/opt/homebrew`, a 1Password vault and scoped **read-only** Service Account, and Git access to your **private** Match repository.
 - Tailscale account for the documented remote-access setup. Configure Remote Login and Screen Sharing in macOS. A Time Machine destination is optional.
 
@@ -131,7 +131,7 @@ These write lanes are **manual administration**, never worker startup steps. The
 
 **Apple Development** uses ASC API operations where supported. The 1Password Bundle ID inventory drives profile reconciliation, and the certificate, private key, and profiles live canonically in Match. **Developer ID Application** signs macOS apps distributed outside the App Store. **Developer ID Installer** signs packages; its validation uses actual `productsign` and `pkgutil --check-signature`, plus certificate/key and chain checks. `signing_status` reads canonical Match state, with warning at 90 days and critical at 30 days before expiry.
 
-If the worker dies, install macOS/Xcode/Homebrew on a new Mac, clone this repository, supply a replacement or recovered scoped Service Account token, run `./bootstrap.sh`, restore from Match through the readonly lanes, and run `./verify.sh`. Re-enable SSH/Tailscale and test a cold reboot without GUI login. Operators do not need to find old `.p12` or `.p8` files; the canonical `.p12` material is encrypted in private Match, and the ASC key body is in 1Password. See the [full recovery checklist](docs/recovery.md#clean-mac-checklist).
+If the worker dies, install macOS/Xcode/Homebrew on a new Mac, clone this repository, supply a valid scoped Service Account token, run `./bootstrap.sh`, restore from Match through the readonly lanes, and run `./verify.sh`. Re-enable SSH/Tailscale and test a cold reboot without GUI login. Operators do not need to find old `.p12` or `.p8` files; the canonical `.p12` material is encrypted in private Match, and the ASC key body is in 1Password. See the [full recovery checklist](docs/recovery.md#clean-mac-checklist).
 
 If Apple has issued a Developer ID certificate but a later validation or Match import fails, the provisioning lane leaves a private `~/.config/xcode-worker/developer-id-recovery-*` directory containing the issued certificate, CSR, and key. **Do not request another certificate immediately.** Diagnose the error and use `recover_developer_id_signing` with the existing certificate ID and absolute directory path. It validates the pair, imports it into Match, validates readonly recovery, then removes the directory. Treat any retained directory as sensitive key material; the pattern is Git-ignored. See [Developer ID canonical assets](docs/developer-id.md#developer-id-canonical-assets).
 
@@ -167,6 +167,6 @@ The main implementation files are:
 
 ## Security and license
 
-Treat coding agents and automation jobs as code running with the privileges of the worker account. Never commit a 1Password Service Account token, ASC private key, Match encryption password, or recovered certificate/private key. Keep the Match repository private and scope the Service Account to read-only access to only the automation vault. Account Holder login is exceptional interactive administrative access, not a worker credential. Recovery directories contain sensitive key material even though they are Git-ignored.
+Treat coding agents and automation jobs as code running with the privileges of the worker account. Never commit a 1Password Service Account token, ASC private key, Match encryption password, or recovered certificate/private key. Keep the Match repository private and scope the Service Account to read-only access to only the automation vault. Account Holder login is infrequent, explicit interactive administrative access, not a worker credential. Recovery directories contain sensitive key material even though they are Git-ignored.
 
 The dedicated keychain and Service Account token are high-value credentials. If a worker is compromised, revoke its Service Account token, issue a replacement, and rotate or revoke exposed credentials. Removing a secret from HEAD does not remove it from Git history. Keep unrelated personal or production credentials off this worker. See [SECURITY.md](SECURITY.md) for private vulnerability reporting and the [MIT License](LICENSE) for licensing.
